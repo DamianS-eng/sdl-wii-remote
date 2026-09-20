@@ -1,0 +1,188 @@
+name: Build and Release
+
+on:
+  workflow_dispatch: 
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env: 
+  EXEC: output
+  SDL_VERSION: 3
+  
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      VERSION: ${{ steps.version.outputs.VERSION }}
+    steps:
+      - name: Extract version from tag 
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}" 
+          else
+            VERSION="manual-${GITHUB_SHA::7}"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          
+  linux:
+    needs: version
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y build-essential pkg-config cmake ninja-build git
+          sudo apt-get install -y gnome-desktop-testing libasound2-dev libpulse-dev libfribidi-dev libjack-dev libsndio-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev libgles2-mesa-dev libegl1-mesa-dev libdbus-1-dev libibus-1.0-dev libudev-dev libthai-dev libpipewire-0.3-dev libwayland-dev libdecor-0-dev
+
+      - name: Cache SDL3
+        id: sdl-cache
+        uses: actions/cache@v4
+        with: 
+          path: |
+            /usr/local/lib/libSDL3*
+            /usr/local/include/SDL3
+          key: sdl3-linux-${{ runner.os }}-${{ hashFiles('**/CMakeLists.txt') }}-${{ env.SDL_VERSION }}
+
+      - name: Build and install SDL3 from source 
+        if: steps.sdl-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/libsdl-org/SDL.git 
+          cd SDL 
+          cmake -S . -B build -G Ninja -DSDL_STATIC=OFF -DSDL_SHARED=ON 
+          cmake --build build 
+          sudo cmake --install build
+
+      - name: Build project
+        run: |
+          cmake -S . -B build
+          cmake --build build
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp "build/${EXEC}" "dist/${EXEC}-linux-${{ needs.version.outputs.VERSION }}"
+
+      - name: Upload linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        name: Install tools
+        with:
+          msystem: UCRT64
+          update: true
+          install: >
+            git
+            make
+            cmake
+            ninja
+            gcc
+            pkgconf
+
+      - name: Cache SDL3
+        id: sdl-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            "$PWD\SDL3"
+          key: sdl3-windows-${{ runner.os }}-${{ env.SDL_VERSION }}
+
+      - name: Build SDL3 for Windows
+        if: steps.sdl-cache.outputs.cache-hit != 'true'
+        run: |
+          echo "Test"
+
+      - name: Package
+        run: |
+          mkdir -p dist
+
+      - name: Upload Windows exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  android:
+    needs: version
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build git unzip
+      - name: Install Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Install NDK
+        run: |
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.0.12077973"
+      - name: Cache SDL Android
+        uses: actions/cache@v4
+        with:
+          path: |
+            SDL
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: sdl3-android-${{ runner.os }}-${{ env.SDL_VERSION }}-${{ hashFiles('**/*.gradle*') }}
+      - name: Build SDL3 for Android
+        run: |
+          echo "Test"
+          
+  release:
+    needs:
+      - version
+      - linux
+      - windows
+      - android
+
+    if: always()
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Download successful artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+        continue-on-error: true
+
+      - name: Show available builds
+        run: |
+          echo "Artifacts:"
+          find dist -type f || true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.VERSION }} 
+          name: Release ${{ needs.version.outputs.VERSION }}
+          files: dist/**/*
+          fail_on_unmatched_files: false
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
