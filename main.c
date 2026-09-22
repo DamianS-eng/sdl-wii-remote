@@ -2,6 +2,11 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 
+#include <SDL3/SDL_joystick.h>
+#include <SDL3/SDL_sensor.h>
+// switch to SDL_gamepad if need a compatible application
+//#include <SDL3/SDL_gamepad.h>
+
 #define SDL_WINDOW_WIDTH 800
 #define SDL_WINDOW_HEIGHT 600
 #define TARGET_FPS 60
@@ -13,6 +18,9 @@
 #define midPiano 49
 #define A4 440.0f
 
+#define WII_VENDOR_ID 0x057e
+#define WII_REMOTE_ID 0x0306
+
 static const char *name = "SDL Template";
 static const char *version = "1";
 static const char *appid = "io.damians-eng.demo";
@@ -20,15 +28,342 @@ static SDL_AudioDeviceID audio_device = SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
 
 typedef struct
 {
-        SDL_Window *window;
-        SDL_Renderer *renderer;
+    SDL_Window *window;
+    SDL_Renderer *renderer;
 	SDL_AudioStream *stream;
-        Uint64 last_time;
+    Uint64 last_time;
 	bool clicked;
 	bool inside;
 } AppState;
 
+typedef struct
+{
+	int axes;
+	int buttons;
+	int hats;
+	bool accel;
+	bool gyro;
+	Sint16 *last_axes;
+	bool *last_buttons;
+	Uint8 *last_hats;
+	float last_accel[3];
+	float last_gyro[3];
+	Uint64 last_sensor_print;
+	Uint64 last_scan;
+	bool first_sample;
+} WiiState;
+// only reading one at a time if placed here
+static WiiState wii;
+
 const Uint64 target_fpns = (Uint64)(1e9 / TARGET_FPS);
+
+static bool about_equal(float a, float b) {
+	return fabsf(a - b) < 0.01f;
+}
+
+// ## Wii Specific Caching
+
+static void free_cached_state(WiiState *wii)
+{
+    SDL_free(wii->last_axes);
+    SDL_free(wii->last_buttons);
+    SDL_free(wii->last_hats);
+
+    wii->last_axes = NULL;
+    wii->last_buttons = NULL;
+    wii->last_hats = NULL;
+}
+
+static bool allocate_cached_state(WiiState *wii) {
+	free_cached_state(wii);
+	if (wii->axes > 0) {
+		wii->last_axes = SDL_malloc((size_t)wii->axes * sizeof(*wii->last_axes));
+		if (!wii->last_axes) {
+			SDL_Log("Allocating axis state, %s\n", SDL_GetError()); return false;
+		}
+		int i;
+		for(i = 0; i < wii->axes; ++i) {
+			wii->last_axes[i] = (Sint16)0x7fff;
+		}
+	}
+	if (wii->buttons > 0) {
+		wii->last_buttons = SDL_malloc((size_t)wii->buttons * sizeof(*wii->last_buttons));
+		if (!wii->last_buttons) {
+			SDL_Log("Allocating button state, %s\n", SDL_GetError()); return false;
+		}
+		memset(wii->last_buttons, 0xff, (size_t)wii->buttons * sizeof(*wii->last_buttons));
+	}
+	if (wii->hats > 0 {
+		wii->last_hats = SDL_malloc((size_t)wii->hats * sizeof(*wii->last_hats));
+		if (!wii->last_hats) {
+			SDL_Log("Allocating hat state, %s\n", SDL_GetError()); return false;
+		}
+		memset(wii->last_hats, 0xff, (size_t)wii->hats * sizeof(*wii->last_hats));
+	}
+	return true;
+}
+
+// ## end Wii Caching
+
+static bool is_probably_wii_remote(SDL_JoystickID id) {
+    return ((Uint16)SDL_GetJoystickVendorForID(id) == WII_VENDOR_ID) || 
+		   ((Uint16)SDL_GetJoystickProductForID(id) == WII_REMOTE_PID);
+}
+
+static SDL_JoystickID find_wii_remote(void)
+{
+    int count = 0;
+    SDL_JoystickID *ids = SDL_GetJoysticks(&count);
+
+    if (!ids) {
+        SDL_Log("Nothing found."); return 0;
+    }
+
+    SDL_JoystickID result = 0;
+
+    for (int i = 0; i < count; ++i) {
+        if (is_probably_wii_remote(ids[i])) {
+            result = ids[i];
+            break;
+        }
+    }
+
+    SDL_free(ids);
+    return result;
+}
+
+// App Init for Wii Remote
+
+static bool open_wii(WiiState *wii, SDL_JoystickID id)
+{
+    memset(wii, 0, sizeof(*wii));
+    wii->joystick = SDL_OpenJoystick(id);
+    if (!wii->joystick) {
+        SDL_Log("Problem on SDL_OpenJoystick, %s\n", SDL_GetError());
+        return false;
+    }
+
+    wii->axes = SDL_GetNumJoystickAxes(wii->joystick);
+    wii->buttons = SDL_GetNumJoystickButtons(wii->joystick);
+    wii->hats = SDL_GetNumJoystickHats(wii->joystick);
+
+    const char *name = SDL_GetJoystickName(wii->joystick);
+    const char *path = SDL_GetJoystickPath(wii->joystick);
+
+    Uint16 vendor = SDL_GetJoystickVendor(wii->joystick);
+    Uint16 product = SDL_GetJoystickProduct(wii->joystick);
+    Uint16 version = SDL_GetJoystickProductVersion(wii->joystick);
+
+    SDL_Log("\n");
+    SDL_Log("============================================================\n");
+    SDL_Log("Wii Remote connected\n");
+    SDL_Log("============================================================\n");
+    SDL_Log("Name:       %s\n", name ? name : "(unknown)");
+    SDL_Log("Path:       %s\n", path ? path : "(unknown)");
+    SDL_Log("Instance:   %" SDL_PRIu32 "\n", SDL_GetJoystickID(wii->joystick));
+    SDL_Log("VID:PID:    %04x:%04x\n", vendor, product);
+    SDL_Log("Version:    %04x\n", version);
+
+    SDL_Log("\n");
+    SDL_Log("SDL controls:\n");
+    SDL_Log("  Axes:     %d\n", wii->axes);
+    SDL_Log("  Buttons:  %d\n", wii->buttons);
+    SDL_Log("  Hats:     %d\n", wii->hats);
+    wii->accel =
+        SDL_JoystickHasSensor(wii->joystick, SDL_SENSOR_ACCEL);
+    wii->gyro =
+        SDL_JoystickHasSensor(wii->joystick, SDL_SENSOR_GYRO);
+    SDL_Log("\n");
+    SDL_Log("Sensors:\n");
+    SDL_Log("  Accelerometer: %s\n", wii->accel ? "YES" : "NO");
+    SDL_Log("  Gyroscope:     %s\n", wii->gyro ? "YES" : "NO");
+
+    if (wii->accel) {
+        if (!SDL_SetJoystickSensorEnabled(
+                wii->joystick, SDL_SENSOR_ACCEL, true)) {
+            SDL_Log("Enabling accelerometer: %s\n", SDL_GetError());
+        } else {
+            SDL_Log(" - Accelerometer enabled\n");
+        }
+    }
+    if (wii->gyro) {
+        if (!SDL_SetJoystickSensorEnabled(
+                wii->joystick, SDL_SENSOR_GYRO, true)) {
+            SDL_Log("Enabling gyroscope: %s\n", SDL_GetError());
+        } else {
+            SDL_Error(" - Gyroscope enabled\n");
+        }
+    }
+
+    if (!allocate_cached_state(wii)) {
+        SDL_CloseJoystick(wii->joystick);
+        wii->joystick = NULL;
+        return false;
+    }
+
+    SDL_Log("\nOutput tests:\n");
+
+    if (SDL_RumbleJoystick(wii->joystick,
+                           0xffff,
+                           0,
+                           250)) {
+        SDL_Log("  Rumble:       YES (250 ms test)\n");
+    } else {
+        SDL_Log("  Rumble:       NO / unsupported\n");
+    }
+
+    if (SDL_SetJoystickLED(wii->joystick, 0, 0, 255)) {
+        SDL_Log("  LED:          YES (blue test)\n");
+    } else {
+        SDL_Log("  LED:          NO / unsupported\n");
+    }
+
+    SDL_Log("\n");
+    SDL_Log("Move buttons/sticks and the Remote.\n");
+    SDL_Log("Attach/detach an extension while this program is running.\n");
+    SDL_Log("Press Escape to quit.\n\n");
+
+    wii->first_sample = true;
+    return true;
+}
+
+// Use in App Close
+
+static void close_wii(WiiState *wii)
+{
+    free_cached_state(wii);
+    if (wii->joystick) {
+        SDL_RumbleJoystick(wii->joystick, 0, 0, 0);
+        SDL_CloseJoystick(wii->joystick);
+        wii->joystick = NULL;
+    }
+}
+
+//
+// ## Reports
+//
+
+static void print_buttons(WiiState *wii)
+{
+    for (int i = 0; i < wii->buttons; ++i) {
+        bool state = SDL_GetJoystickButton(wii->joystick, i);
+        if (wii->first_sample || state != wii->last_buttons[i]) {
+            SDL_Log("BUTTON[%02d] = %s\n",
+                   i,
+                   state ? "DOWN" : "UP");
+
+            wii->last_buttons[i] = state;
+        }
+    }
+}
+
+
+static void print_axes(WiiState *wii)
+{
+    for (int i = 0; i < wii->axes; ++i) {
+        Sint16 state = SDL_GetJoystickAxis(wii->joystick, i);
+        if (wii->first_sample ||
+            abs((int)state - (int)wii->last_axes[i]) > 256) {
+            SDL_Log("AXIS[%02d]   = %6d (%+.3f)\n",
+                   i,
+                   state,
+                   (double)state / 32767.0);
+            wii->last_axes[i] = state;
+        }
+    }
+}
+
+
+static void print_hats(WiiState *wii)
+{
+    for (int i = 0; i < wii->hats; ++i) {
+        Uint8 state = SDL_GetJoystickHat(wii->joystick, i);
+        if (wii->first_sample || state != wii->last_hats[i]) {
+            SDL_Log("HAT[%02d]    = %s (0x%02x)\n",
+                   i,
+                   hat_name(state),
+                   state);
+            wii->last_hats[i] = state;
+        }
+    }
+}
+
+
+static void print_sensor_values(void *appstate, WiiState *wii)
+{
+	AppState *as = (AppState *)appstate;
+	const int sensor_print_ms = 100;
+    if (as->last_time - wii->last_sensor_print < sensor_print_ms) {
+        return;
+    }
+    wii->last_sensor_print = as->last_time;
+
+    bool print = false;
+
+    float accel[3];
+    float gyro[3];
+
+    if (wii->accel &&
+        SDL_GetJoystickSensorData(wii->joystick, SDL_SENSOR_ACCEL, accel, 3)) {
+        if (wii->first_sample ||
+            !about_equal(accel[0], wii->last_accel[0]) ||
+            !about_equal(accel[1], wii->last_accel[1]) ||
+            !about_equal(accel[2], wii->last_accel[2])) {
+			print = true;
+            memcpy(wii->last_accel, accel, sizeof(wii->last_accel));
+        }
+    }
+
+    if (wii->gyro &&
+        SDL_GetJoystickSensorData(wii->joystick, SDL_SENSOR_GYRO, gyro, 3)) {
+        if (wii->first_sample ||
+            !about_equal(gyro[0], wii->last_gyro[0]) ||
+            !about_equal(gyro[1], wii->last_gyro[1]) ||
+            !about_equal(gyro[2], wii->last_gyro[2])) {
+            print = true;
+            memcpy(wii->last_gyro, gyro, sizeof(wii->last_gyro));
+        }
+    }
+
+    if (!print) {
+        return;
+    }
+
+    if (wii->accel) {
+        SDL_Log("ACCEL       = %+7.3f %+7.3f %+7.3f m/s^2\n",
+               (double)accel[0],
+               (double)accel[1],
+               (double)accel[2]);
+    }
+
+    if (wii->gyro) {
+        SDL_Log("GYRO        = %+7.3f %+7.3f %+7.3f rad/s\n",
+               (double)gyro[0],
+               (double)gyro[1],
+               (double)gyro[2]);
+    }
+}
+
+
+static void poll_wii(void *appstate, WiiState *wii)
+{
+    AppState *as = (AppState *)appstate;
+    SDL_UpdateJoysticks();
+
+    print_buttons(wii);
+    print_axes(wii);
+    print_hats(wii);
+    print_sensor_values(wii, as->last_time);
+
+    if (wii->first_sample) {
+        SDL_Log("\n");
+        wii->first_sample = false;
+    }
+}
+
+//
+// ## End Reports
+//
 
 static int current_sine_sample = 0;
 //static int freq = 240;
@@ -95,7 +430,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
         return SDL_APP_FAILURE;
     }
 
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS)) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS | SDL_INIT_JOYSTICK)) {
         SDL_Log("Couldn't initialize SDL: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
@@ -106,6 +441,8 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
     }
     SDL_SetRenderLogicalPresentation(as->renderer, SDL_WINDOW_WIDTH, SDL_WINDOW_HEIGHT, SDL_LOGICAL_PRESENTATION_LETTERBOX);
 
+	memset(&wii, 0, sizeof(wii));
+	
     SDL_AudioSpec spec;
     spec.channels = 2;
     spec.format = SDL_AUDIO_F32;
@@ -176,6 +513,20 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event)
       }
       SDL_Log("\n");
       break;
+	case SDL_EVENT_JOYSTICK_ADDED:
+		SDL_Log("Joystick added: %u\n", event->jdevice.which);
+		if(!wii.joystick && is_probably_wii_remote(event->jdevice.which)) {
+			if(!open_wii(&wii, event->jdevice.which)) {
+				SDL_Log("Failed to open Remote: %s\n", SDL_GetError());
+			}
+		}
+	  break;
+	case SDL_EVENT_JOYSTICK_REMOVED:
+		if (wii.joystick && event->jdevice.which == SDL_GetJoystickID(wii.joystick)) {
+			close_wii(&wii);
+			SDL_Log("Remote disconnected.\n");
+		}
+		break;
     default:
       return SDL_APP_CONTINUE;
   }
@@ -187,6 +538,14 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     AppState *as = (AppState *)appstate;
     const Uint64 now = SDL_GetTicksNS();
     const Uint64 elapsed = now - as->last_time;
+	if (wii.joystick) {
+		if (!allocate_cached_state(&wii)) {
+			SDL_Log("Unable to resize input state\n"); close_wii(&wii);
+		} else {
+			wii.first_sample = true;
+		}
+		poll_wii(&wii);
+	}
     if (elapsed >= target_fpns) {
         as->last_time = now;
         SDL_SetRenderDrawColor(as->renderer, 30, 30, 30, SDL_ALPHA_OPAQUE);
@@ -213,10 +572,10 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         const Uint64 remaining = target_fpns - elapsed;
         SDL_DelayNS(remaining);
     }
-
     return SDL_APP_CONTINUE; 
 }
 
 void SDL_AppQuit(void *appstate, SDL_AppResult result)
 {
+	close_wii(&wii);
 }
