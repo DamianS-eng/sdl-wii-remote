@@ -539,7 +539,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     AppState *as = (AppState *)appstate;
     const Uint64 now = SDL_GetTicksNS();
     const Uint64 elapsed = now - as->last_time;
-	if (wii.joystick) {
+	if (joystick) {
 		if (!allocate_cached_state(&wii)) {
 			SDL_Log("Unable to resize input state\n"); close_wii(&wii);
 		} else {
