@@ -4,7 +4,7 @@ project(output)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIGURATION>")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIGURATION>")
 
-option(MYGAME_VENDORED "Use vendored libraries" OFF)
+option(MYGAME_VENDORED "Use vendored libraries" ON)
 
 if(MYGAME_VENDORED)
     add_subdirectory(vendored/SDL EXCLUDE_FROM_ALL)

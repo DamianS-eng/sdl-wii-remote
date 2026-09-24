@@ -280,9 +280,9 @@ static void print_hats(WiiState *wii)
     for (int i = 0; i < wii->hats; ++i) {
         Uint8 state = SDL_GetJoystickHat(joystick, i);
         if (wii->first_sample || state != wii->last_hats[i]) {
-            SDL_Log("HAT[%02d]    = %c (0x%02x)\n",
+            SDL_Log("HAT[%02d]    = (0x%02x)\n",
                    i,
-                   hat_name(state),
+                   //(char)state,
                    state);
             wii->last_hats[i] = state;
         }
@@ -354,7 +354,7 @@ static void poll_wii(void *appstate, WiiState *wii)
     print_buttons(wii);
     print_axes(wii);
     print_hats(wii);
-    print_sensor_values(wii, as->last_time);
+    print_sensor_values(as, wii);
 
     if (wii->first_sample) {
         SDL_Log("\n");
@@ -509,10 +509,10 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event)
 	    ( event->motion.x < endx ) && 
             ( beginy < event->motion.y) &&
 	    ( event->motion.y < endy)) {
-	  SDL_Log("Inside!");
+	  //SDL_Log("Inside!");
           as->inside = true;
       }
-      SDL_Log("\n");
+      //SDL_Log("\n");
       break;
 	case SDL_EVENT_JOYSTICK_ADDED:
 		SDL_Log("Joystick added: %u\n", event->jdevice.which);
